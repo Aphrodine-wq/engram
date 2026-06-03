@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv*/
+.pytest_cache/
+
+# Engram data — never commit screen memory
+*.db
+*.db-wal
+*.db-shm
+.engram/
+
+# OS
+.DS_Store
+*.jpg
+*.png
+*.log

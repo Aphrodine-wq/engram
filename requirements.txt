@@ -1,0 +1,13 @@
+# Core
+mcp>=1.0.0
+imagehash>=4.3
+Pillow>=10.0
+
+# Recommended: native Apple Vision OCR (macOS)
+pyobjc-core>=10.0
+pyobjc-framework-Vision>=10.0
+pyobjc-framework-Quartz>=10.0
+
+# Optional: encryption at rest
+cryptography>=42.0
+keyring>=25.0

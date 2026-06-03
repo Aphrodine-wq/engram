@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engram-memory"
+version = "0.1.0"
+description = "Your computer's photographic memory — local-first screen OCR memory, searchable and AI-ready."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "James Walton" }]
+keywords = ["ocr", "screen-memory", "recall", "mcp", "local-first", "privacy", "ai-agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "imagehash>=4.3",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+# macOS native OCR (Apple Vision framework). Without these, Engram falls back
+# to the `tesseract` CLI if it's installed (brew install tesseract).
+vision = [
+    "pyobjc-core>=10.0",
+    "pyobjc-framework-Vision>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+]
+# Encryption-at-rest with an OS-keychain-held key.
+encryption = [
+    "cryptography>=42.0",
+    "keyring>=25.0",
+]
+# Optional Claude Vision enrichment of frames.
+vision-api = ["anthropic>=0.40.0"]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/Aphrodine-wq/engram"
+Source = "https://github.com/Aphrodine-wq/engram"
+
+[project.scripts]
+engram = "engram.cli:main"
+engram-mcp = "engram.mcp_server:main"
+
+[tool.setuptools]
+packages = ["engram"]
