@@ -54,10 +54,9 @@ def watch(interval: float | None = None, scale: float = 0.5,
                 time.sleep(interval)
                 continue
 
-            cap.submit(prev_phash=prev_phash, window_info=(app_name, window_title),
-                       scale=scale, fast_ocr=fast_ocr)
-
-            # Drain any frame that finished since last tick.
+            # Drain any frame that finished since the last tick BEFORE submitting
+            # a new job — submit() overwrites the pending future, so draining
+            # afterwards would silently discard every completed result.
             frame = cap.get_result()
             if frame is not None:
                 prev_phash = frame.phash or prev_phash
@@ -72,6 +71,9 @@ def watch(interval: float | None = None, scale: float = 0.5,
                 captured += 1
                 if captured % 10 == 0:
                     log.info("captured %d frames", captured)
+
+            cap.submit(prev_phash=prev_phash, window_info=(app_name, window_title),
+                       scale=scale, fast_ocr=fast_ocr)
 
             # Reload config periodically so edits take effect without a restart.
             config = load_config()
