@@ -79,15 +79,72 @@ def capture_screenshot(path: Optional[str] = None, scale: float = 0.5) -> str:
 
 def _capture_screenshot_pillow(path: str):
     """
-    Cross-platform screenshot via Pillow. On Windows this grabs all monitors
-    (the full virtual desktop); the temp PNG-in-memory is saved as JPEG.
+    Cross-platform screenshot via Pillow.
+
+    On Windows we grab only the **focused window's** rectangle when we can find
+    it — this crops out the taskbar, desktop icons, and other monitors, which
+    dramatically reduces OCR noise (the whole reason a desktop capture reads as
+    garbage). Falls back to the full virtual desktop if the foreground window
+    can't be resolved or isn't usable.
     """
     from PIL import ImageGrab
+
+    bbox = _foreground_window_bbox() if IS_WINDOWS else None
     try:
-        img = ImageGrab.grab(all_screens=True)  # Windows: span all monitors
+        if bbox:
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        else:
+            img = ImageGrab.grab(all_screens=True)  # span all monitors
     except TypeError:
         img = ImageGrab.grab()  # older Pillow / non-Windows without the kwarg
-    img.convert("RGB").save(path, "JPEG", quality=80)
+    img.convert("RGB").save(path, "JPEG", quality=85)
+
+
+def _foreground_window_bbox():
+    """
+    (left, top, right, bottom) of the focused window in virtual-screen
+    coordinates, or None if it can't be resolved.
+
+    Uses the DWM *extended frame bounds* (which exclude the invisible resize
+    border / drop shadow) and falls back to GetWindowRect. Returns None for a
+    minimized window or an implausibly small rect, so the caller drops back to
+    a full-screen grab.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd or user32.IsIconic(hwnd):
+            return None
+
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        rect = wintypes.RECT()
+        hr = dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect)
+        )
+        if hr != 0:  # not S_OK — fall back to the plain window rect
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        if (right - left) < 200 or (bottom - top) < 150:
+            return None  # too small to be a useful content window
+        return (left, top, right, bottom)
+    except Exception:
+        return None
 
 
 def _downscale(path: str, scale: float):
@@ -329,25 +386,68 @@ def _find_tesseract() -> Optional[str]:
     return None
 
 
+def _preprocess_for_ocr(image_path: str) -> Optional[str]:
+    """
+    Produce a temp image tuned for Tesseract and return its path (caller deletes).
+
+    Tesseract is trained on ~300-DPI black-on-white text; raw screenshots are
+    low-DPI and full-color, which is why UI text reads as garbage. We convert to
+    grayscale, upscale small captures so glyphs are big enough to recognize,
+    autocontrast, and lightly sharpen. Returns None if Pillow is unavailable, so
+    the caller can OCR the original.
+    """
+    try:
+        from PIL import Image, ImageOps, ImageFilter
+    except Exception:
+        return None
+    try:
+        img = Image.open(image_path).convert("L")  # grayscale
+        w, h = img.size
+        target_w = 1600  # upscale narrow/window captures; leave big ones alone
+        if 0 < w < target_w:
+            factor = min(3.0, target_w / w)
+            img = img.resize((int(w * factor), int(h * factor)), Image.LANCZOS)
+        img = ImageOps.autocontrast(img)
+        img = img.filter(ImageFilter.SHARPEN)
+        fd, out = tempfile.mkstemp(suffix=".png", prefix="ceyes_ocr_")
+        os.close(fd)
+        img.save(out, "PNG")
+        return out
+    except Exception:
+        return None
+
+
 def _ocr_tesseract(image_path: str) -> str:
     """
     Fallback OCR using tesseract. This is the primary OCR path on Windows/Linux.
     Install: Windows `winget install UB-Mannheim.TesseractOCR`, macOS `brew install tesseract`.
+
+    Off macOS the image is preprocessed (grayscale/upscale/contrast) first, which
+    markedly improves accuracy on screen captures.
     """
     exe = _find_tesseract()
     if not exe:
         return ("[OCR unavailable — install pyobjc-framework-Vision (macOS) or "
                 "tesseract (winget install UB-Mannheim.TesseractOCR / brew install tesseract)]")
+
+    ocr_path, tmp = image_path, None
+    if not IS_MACOS:
+        tmp = _preprocess_for_ocr(image_path)
+        if tmp:
+            ocr_path = tmp
     try:
         result = subprocess.run(
-            [exe, image_path, "stdout", "-l", "eng",
+            [exe, ocr_path, "stdout", "-l", "eng",
              "--psm", "3",          # auto page segmentation
              "--oem", "1"],          # LSTM engine
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=20
         )
         return result.stdout.strip()
     except Exception:
         return ""
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 # ---------------------------------------------------------------------------
