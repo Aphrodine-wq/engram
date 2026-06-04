@@ -116,7 +116,22 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _force_utf8_output() -> None:
+    """
+    Windows consoles default to a legacy code page (e.g. cp1252) that raises
+    UnicodeEncodeError on the non-ASCII text that OCR routinely produces.
+    Reconfigure std streams to UTF-8 so printing search/recent/activity output
+    never crashes. No-op where streams aren't reconfigurable.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None) -> int:
+    _force_utf8_output()
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

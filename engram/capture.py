@@ -14,6 +14,8 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import os
+import sys
+import shutil
 import time
 import logging
 from dataclasses import dataclass
@@ -21,6 +23,11 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, Future
 
 log = logging.getLogger("engram.capture")
+
+# Platform detection. The capture/window/OCR backends differ per-OS; everything
+# downstream of ScreenFrame (store, search, REST, MCP) is platform-agnostic.
+IS_MACOS = sys.platform == "darwin"
+IS_WINDOWS = sys.platform.startswith("win")
 
 
 @dataclass
@@ -40,29 +47,121 @@ class ScreenFrame:
 
 def capture_screenshot(path: Optional[str] = None, scale: float = 0.5) -> str:
     """
-    Take a screenshot using macOS screencapture.
-    Uses JPEG (faster I/O than PNG) and downscales via sips
-    to reduce OCR processing time on Intel CPUs.
+    Take a screenshot to a temp JPEG and downscale it to reduce OCR workload.
+
+    Backend is per-OS: macOS uses the native `screencapture`/`sips` tools;
+    everything else (Windows, Linux) uses Pillow's ImageGrab. JPEG is used for
+    faster I/O than PNG. The file is deleted by the caller in `capture_frame`.
     """
     if path is None:
         fd, path = tempfile.mkstemp(suffix=".jpg", prefix="ceyes_")
         os.close(fd)
 
-    # -x = no sound, -t jpg = JPEG format (faster than PNG)
-    subprocess.run(
-        ["screencapture", "-x", "-t", "jpg", path],
-        check=True,
-        capture_output=True,
-    )
+    if IS_MACOS:
+        # -x = no sound, -t jpg = JPEG format (faster than PNG)
+        subprocess.run(
+            ["screencapture", "-x", "-t", "jpg", path],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        _capture_screenshot_pillow(path)
 
-    # Downscale to reduce OCR workload on Intel CPU
+    # Downscale to reduce OCR workload on CPU
     if scale < 1.0:
         try:
-            _downscale_sips(path, scale)
+            _downscale(path, scale)
         except Exception:
-            pass  # if sips fails, just OCR at full res
+            pass  # if resize fails, just OCR at full res
 
     return path
+
+
+def _capture_screenshot_pillow(path: str):
+    """
+    Cross-platform screenshot via Pillow.
+
+    On Windows we grab only the **focused window's** rectangle when we can find
+    it — this crops out the taskbar, desktop icons, and other monitors, which
+    dramatically reduces OCR noise (the whole reason a desktop capture reads as
+    garbage). Falls back to the full virtual desktop if the foreground window
+    can't be resolved or isn't usable.
+    """
+    from PIL import ImageGrab
+
+    bbox = _foreground_window_bbox() if IS_WINDOWS else None
+    try:
+        if bbox:
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        else:
+            img = ImageGrab.grab(all_screens=True)  # span all monitors
+    except TypeError:
+        img = ImageGrab.grab()  # older Pillow / non-Windows without the kwarg
+    img.convert("RGB").save(path, "JPEG", quality=85)
+
+
+def _foreground_window_bbox():
+    """
+    (left, top, right, bottom) of the focused window in virtual-screen
+    coordinates, or None if it can't be resolved.
+
+    Uses the DWM *extended frame bounds* (which exclude the invisible resize
+    border / drop shadow) and falls back to GetWindowRect. Returns None for a
+    minimized window or an implausibly small rect, so the caller drops back to
+    a full-screen grab.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd or user32.IsIconic(hwnd):
+            return None
+
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        rect = wintypes.RECT()
+        hr = dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect)
+        )
+        if hr != 0:  # not S_OK — fall back to the plain window rect
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        if (right - left) < 200 or (bottom - top) < 150:
+            return None  # too small to be a useful content window
+        return (left, top, right, bottom)
+    except Exception:
+        return None
+
+
+def _downscale(path: str, scale: float):
+    """Resize the screenshot in place, picking the fastest backend per-OS."""
+    if IS_MACOS:
+        _downscale_sips(path, scale)
+    else:
+        _downscale_pillow(path, scale)
+
+
+def _downscale_pillow(path: str, scale: float):
+    """Resize via Pillow — used on Windows/Linux where `sips` doesn't exist."""
+    from PIL import Image
+    img = Image.open(path)
+    width, height = img.size
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    img.convert("RGB").resize(new_size, Image.LANCZOS).save(path, "JPEG", quality=80)
 
 
 def _downscale_sips(path: str, scale: float):
@@ -90,7 +189,16 @@ def _downscale_sips(path: str, scale: float):
 # ---------------------------------------------------------------------------
 
 def get_active_window_info() -> tuple[str, str]:
-    """Get the active app name and window title via AppleScript."""
+    """Get the active app name and window title for the current OS."""
+    if IS_MACOS:
+        return _active_window_macos()
+    if IS_WINDOWS:
+        return _active_window_windows()
+    return ("", "")
+
+
+def _active_window_macos() -> tuple[str, str]:
+    """Active app name and window title via AppleScript."""
     script = '''
     tell application "System Events"
         set frontApp to name of first application process whose frontmost is true
@@ -110,6 +218,83 @@ def get_active_window_info() -> tuple[str, str]:
         return (parts[0] if len(parts) > 0 else "", parts[1] if len(parts) > 1 else "")
     except Exception:
         return ("", "")
+
+
+def _active_window_windows() -> tuple[str, str]:
+    """
+    Active process name + window title via the Win32 API (ctypes, no deps).
+
+    app_name is the foreground process's executable basename without `.exe`
+    (e.g. "chrome", "Code"); window_title is its title-bar text. Both empty on
+    failure. restype/argtypes are set explicitly so HANDLE/HWND aren't
+    truncated on 64-bit.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ("", "")
+
+        length = user32.GetWindowTextLengthW(hwnd)
+        title = ""
+        if length > 0:
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        app_name = _process_name_windows(pid.value)
+        return (app_name, title)
+    except Exception:
+        return ("", "")
+
+
+def _process_name_windows(pid: int) -> str:
+    """Executable basename (sans `.exe`) for a PID via QueryFullProcessImageNameW."""
+    if not pid:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(260)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                base = os.path.basename(buf.value)
+                if base.lower().endswith(".exe"):
+                    base = base[:-4]
+                return base
+            return ""
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -185,20 +370,84 @@ def _ocr_vision(image_path: str, fast: bool = True) -> str:
         return ""
 
 
+def _find_tesseract() -> Optional[str]:
+    """Locate the tesseract binary: PATH first, then common install dirs."""
+    exe = shutil.which("tesseract")
+    if exe:
+        return exe
+    candidates = [
+        os.environ.get("TESSERACT_CMD", ""),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def _preprocess_for_ocr(image_path: str) -> Optional[str]:
+    """
+    Produce a temp image tuned for Tesseract and return its path (caller deletes).
+
+    Tesseract is trained on ~300-DPI black-on-white text; raw screenshots are
+    low-DPI and full-color, which is why UI text reads as garbage. We convert to
+    grayscale, upscale small captures so glyphs are big enough to recognize,
+    autocontrast, and lightly sharpen. Returns None if Pillow is unavailable, so
+    the caller can OCR the original.
+    """
+    try:
+        from PIL import Image, ImageOps, ImageFilter
+    except Exception:
+        return None
+    try:
+        img = Image.open(image_path).convert("L")  # grayscale
+        w, h = img.size
+        target_w = 1600  # upscale narrow/window captures; leave big ones alone
+        if 0 < w < target_w:
+            factor = min(3.0, target_w / w)
+            img = img.resize((int(w * factor), int(h * factor)), Image.LANCZOS)
+        img = ImageOps.autocontrast(img)
+        img = img.filter(ImageFilter.SHARPEN)
+        fd, out = tempfile.mkstemp(suffix=".png", prefix="ceyes_ocr_")
+        os.close(fd)
+        img.save(out, "PNG")
+        return out
+    except Exception:
+        return None
+
+
 def _ocr_tesseract(image_path: str) -> str:
-    """Fallback OCR using tesseract. Install: brew install tesseract"""
+    """
+    Fallback OCR using tesseract. This is the primary OCR path on Windows/Linux.
+    Install: Windows `winget install UB-Mannheim.TesseractOCR`, macOS `brew install tesseract`.
+
+    Off macOS the image is preprocessed (grayscale/upscale/contrast) first, which
+    markedly improves accuracy on screen captures.
+    """
+    exe = _find_tesseract()
+    if not exe:
+        return ("[OCR unavailable — install pyobjc-framework-Vision (macOS) or "
+                "tesseract (winget install UB-Mannheim.TesseractOCR / brew install tesseract)]")
+
+    ocr_path, tmp = image_path, None
+    if not IS_MACOS:
+        tmp = _preprocess_for_ocr(image_path)
+        if tmp:
+            ocr_path = tmp
     try:
         result = subprocess.run(
-            ["tesseract", image_path, "stdout", "-l", "eng",
+            [exe, ocr_path, "stdout", "-l", "eng",
              "--psm", "3",          # auto page segmentation
              "--oem", "1"],          # LSTM engine
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=20
         )
         return result.stdout.strip()
-    except FileNotFoundError:
-        return "[OCR unavailable — install pyobjc-framework-Vision or: brew install tesseract]"
     except Exception:
         return ""
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 # ---------------------------------------------------------------------------
