@@ -112,11 +112,57 @@ for hit in store.search("that stack trace"):
 - **Threaded OCR** keeps the capture loop from stalling on a slow frame.
 - **FTS5 + porter stemming** gives you ranked full-text search out of the box; a TF-IDF index adds semantic ranking.
 
+## Audio — what you heard, in the same timeline (opt-in)
+
+`engram listen` adds the other half of memory: it transcribes your microphone locally and stores the **text** alongside your screen captures, so one search spans what you *saw* and what you *heard*.
+
+```
+ record mic ──▶ RMS/VAD gate ──▶ Whisper STT ──▶ cleanup ──▶ redact ──▶ SQLite + FTS5
+ (16k mono,     (skip silence,    (faster-whisper  (reuse     (same        (source='audio',
+  in memory)     never decode)     local, on CPU)   filters)   redactor)     same index)
+```
+
+It's the screen pipeline with two boxes swapped — and **raw audio is never written to disk, not even a temp file.** Samples live in an in-memory buffer, get transcribed, and are dropped. Only redacted transcript text is stored.
+
+```bash
+pip install 'engram-memory[audio]'   # adds sounddevice + faster-whisper
+engram listen                        # records mic in 15s segments; Ctrl-C to stop
+engram search "what did we decide about pricing"   # hits screen AND audio
+```
+
+Audio is **off by default** and a separate command from `engram watch` — running it is the consent. First run downloads a small Whisper model (~75MB). **Recording people speaking can be illegal without consent (two-party-consent states); make sure the room knows.**
+
+## Ask your memory — recall that understands, not just records
+
+Keyword search finds the row. `engram ask` answers the question — across everything you saw *and* heard, with citations.
+
+```bash
+engram ask "what did we decide about pricing on the call"
+```
+```
+Based on what you saw and heard:
+  • [heard, Jun 26 10:48, zoom — standup] Josh said we should ship the audio feature friday
+  • [seen,  Jun 26 10:49, Cursor — audio.py] record segment then transcribe locally
+
+  entities: Josh, FTW, audio.py, zoom
+```
+
+Under the hood it fuses keyword (FTS5) and semantic (TF-IDF) rankings over the unified seen-and-heard timeline, returns ranked **cited** evidence, and resolves the entities involved. It never calls a model or the network — Engram hands your agent the facts and the citations; the agent writes the sentence. Over MCP that's the `engram_ask` tool.
+
+There's also a lightweight knowledge graph — who and what your memory connects:
+
+```bash
+engram connections "Josh"      # people, projects, apps, files that co-occur with Josh
+```
+
+This is the half Microsoft Recall and frame-recording tools don't have: they store more pixels; Engram builds understanding over text. (Lexical TF-IDF matches shared salient terms today; local embeddings for true synonym recall slot in behind the same `ask()`.)
+
 ## Privacy — the whole point
 
 A screen-watching tool run by someone else's cloud is a surveillance product. Engram is the opposite by construction:
 
 - **No images stored.** Ever. Only redacted text.
+- **No audio stored.** The mic path (opt-in) keeps raw samples in memory only and stores just the redacted transcript.
 - **Secrets redacted before write**, and configured apps (password managers) are never captured.
 - **No network.** The REST API binds to `127.0.0.1`. The MCP server speaks over stdio. Nothing phones home.
 - **Optional encryption at rest** with an OS-keychain key.

@@ -45,6 +45,35 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="engram_ask",
+            description="Ask a natural-language question about everything the user has seen AND "
+                        "heard. Returns ranked, cited evidence (screen + audio) fused from keyword "
+                        "and semantic search, plus the entities involved. Synthesize the prose "
+                        "answer yourself from the evidence — each item has a timestamp and source.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Natural-language question"},
+                    "limit": {"type": "integer", "default": 8},
+                },
+                "required": ["question"],
+            },
+        ),
+        Tool(
+            name="engram_connections",
+            description="Knowledge-graph lookup: the people, projects, apps, and files connected "
+                        "to a given entity across the user's memory, ranked by co-occurrence. Use "
+                        "for 'what's related to X' or 'who/what works on Y'.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entity": {"type": "string", "description": "Person, project, app, or file name"},
+                    "limit": {"type": "integer", "default": 15},
+                },
+                "required": ["entity"],
+            },
+        ),
+        Tool(
             name="engram_recent",
             description="The last N minutes of screen activity, newest first. "
                         "Use to catch up on what the user was just doing.",
@@ -87,6 +116,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     if name == "engram_search":
         text = _dump(store.search(args["query"], args.get("limit", 20)))
+    elif name == "engram_ask":
+        from engram.intelligence import ask
+        res = ask(args["question"], limit=args.get("limit", 8), store=store)
+        text = json.dumps(asdict(res), default=str, indent=2)
+    elif name == "engram_connections":
+        from engram.intelligence import connections
+        text = json.dumps(
+            connections(args["entity"], limit=args.get("limit", 15), store=store),
+            default=str, indent=2,
+        )
     elif name == "engram_recent":
         text = _dump(store.get_recent(args.get("minutes", 30), args.get("limit", 50)))
     elif name == "engram_latest":

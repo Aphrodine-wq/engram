@@ -207,6 +207,7 @@ class ScreenEntry:
     text: str
     extra_context: str
     project: str = ""
+    source: str = "screen"
 
     def _decrypt(self) -> "ScreenEntry":
         """Decrypt encrypted fields in-place. Handles mixed encrypted/plaintext."""
@@ -266,6 +267,18 @@ class EyesStore:
             except sqlite3.OperationalError:
                 pass  # table doesn't exist yet, CREATE TABLE will handle it
 
+        # Migration: add source column ('screen' | 'audio') so transcripts share
+        # the frames table and the one FTS5 index — a single seen-and-heard
+        # timeline. Existing rows default to 'screen'.
+        try:
+            self.conn.execute("SELECT source FROM frames LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                self.conn.execute("ALTER TABLE frames ADD COLUMN source TEXT DEFAULT 'screen'")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                pass  # table doesn't exist yet, CREATE TABLE will handle it
+
         self.conn.executescript("""
             -- Profile tables (persistent user insights + mood/energy log)
             CREATE TABLE IF NOT EXISTS user_insights (
@@ -307,12 +320,14 @@ class EyesStore:
                 text TEXT NOT NULL,
                 extra_context TEXT DEFAULT '',
                 phash TEXT DEFAULT '',
-                project TEXT DEFAULT ''
+                project TEXT DEFAULT '',
+                source TEXT DEFAULT 'screen'
             );
 
             CREATE INDEX IF NOT EXISTS idx_frames_timestamp ON frames(timestamp);
             CREATE INDEX IF NOT EXISTS idx_frames_app ON frames(app_name);
             CREATE INDEX IF NOT EXISTS idx_frames_project ON frames(project);
+            CREATE INDEX IF NOT EXISTS idx_frames_source ON frames(source);
 
             -- FTS5 virtual table for full-text search
             CREATE VIRTUAL TABLE IF NOT EXISTS frames_fts USING fts5(
@@ -348,14 +363,14 @@ class EyesStore:
 
     def insert(self, timestamp: float, app_name: str, window_title: str,
                text: str, extra_context: str = "", phash: str = "",
-               project: str = "") -> int:
+               project: str = "", source: str = "screen") -> int:
         if self._encryption_enabled:
             from engram.encryption import encrypt_fields
             text, window_title, extra_context = encrypt_fields(text, window_title, extra_context)
         cur = self.conn.execute(
-            "INSERT INTO frames (timestamp, app_name, window_title, text, extra_context, phash, project) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (timestamp, app_name, window_title, text, extra_context, phash, project)
+            "INSERT INTO frames (timestamp, app_name, window_title, text, extra_context, phash, project, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (timestamp, app_name, window_title, text, extra_context, phash, project, source)
         )
         self.conn.commit()
         return cur.lastrowid
@@ -467,7 +482,7 @@ class EyesStore:
     def get_recent(self, minutes: int = 30, limit: int = 50) -> list[ScreenEntry]:
         cutoff = time.time() - (minutes * 60)
         rows = self.conn.execute(
-            "SELECT id, timestamp, app_name, window_title, text, extra_context, project "
+            "SELECT id, timestamp, app_name, window_title, text, extra_context, project, source "
             "FROM frames WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?",
             (cutoff, limit)
         ).fetchall()
@@ -475,7 +490,7 @@ class EyesStore:
 
     def get_latest(self) -> Optional[ScreenEntry]:
         row = self.conn.execute(
-            "SELECT id, timestamp, app_name, window_title, text, extra_context, project "
+            "SELECT id, timestamp, app_name, window_title, text, extra_context, project, source "
             "FROM frames ORDER BY timestamp DESC LIMIT 1"
         ).fetchone()
         return self._entry(row)
@@ -488,7 +503,7 @@ class EyesStore:
         rows = self.conn.execute(
             "SELECT f.id, f.timestamp, f.app_name, f.window_title, "
             "       snippet(frames_fts, 0, '>>>', '<<<', '...', 40) as text, "
-            "       f.extra_context, f.project "
+            "       f.extra_context, f.project, f.source "
             "FROM frames_fts "
             "JOIN frames f ON f.id = frames_fts.rowid "
             "WHERE frames_fts MATCH ? "
@@ -501,7 +516,7 @@ class EyesStore:
         """Search encrypted DB by decrypting recent entries and filtering in Python."""
         # Search non-encrypted fields first (app_name, project)
         rows = self.conn.execute(
-            "SELECT id, timestamp, app_name, window_title, text, extra_context, project "
+            "SELECT id, timestamp, app_name, window_title, text, extra_context, project, source "
             "FROM frames WHERE app_name LIKE ? OR project LIKE ? "
             "ORDER BY timestamp DESC LIMIT ?",
             (f"%{query}%", f"%{query}%", limit * 5)
@@ -515,7 +530,7 @@ class EyesStore:
         # Broader scan — decrypt last 2 hours and search
         cutoff = time.time() - 7200
         rows = self.conn.execute(
-            "SELECT id, timestamp, app_name, window_title, text, extra_context, project "
+            "SELECT id, timestamp, app_name, window_title, text, extra_context, project, source "
             "FROM frames WHERE timestamp > ? ORDER BY timestamp DESC LIMIT 500",
             (cutoff,)
         ).fetchall()
@@ -567,7 +582,7 @@ class EyesStore:
     def search_by_app(self, app_name: str, minutes: int = 60, limit: int = 20) -> list[ScreenEntry]:
         cutoff = time.time() - (minutes * 60)
         rows = self.conn.execute(
-            "SELECT id, timestamp, app_name, window_title, text, extra_context, project "
+            "SELECT id, timestamp, app_name, window_title, text, extra_context, project, source "
             "FROM frames WHERE app_name LIKE ? AND timestamp > ? "
             "ORDER BY timestamp DESC LIMIT ?",
             (f"%{app_name}%", cutoff, limit)
@@ -598,7 +613,7 @@ class EyesStore:
     def get_by_time_range(self, start: float, end: float, limit: int = 100) -> list[ScreenEntry]:
         """Get entries within an absolute time range."""
         rows = self.conn.execute(
-            "SELECT id, timestamp, app_name, window_title, text, extra_context, project "
+            "SELECT id, timestamp, app_name, window_title, text, extra_context, project, source "
             "FROM frames WHERE timestamp >= ? AND timestamp <= ? "
             "ORDER BY timestamp DESC LIMIT ?",
             (start, end, limit)

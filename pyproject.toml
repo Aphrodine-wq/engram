@@ -41,6 +41,13 @@ encryption = [
 ]
 # Optional Claude Vision enrichment of frames.
 vision-api = ["anthropic>=0.40.0"]
+# Microphone capture + local speech-to-text (the `engram listen` command).
+# Off by default; raw audio is never written to disk, only redacted transcript.
+audio = [
+    "sounddevice>=0.4",
+    "faster-whisper>=1.0",
+    "numpy>=1.24",
+]
 dev = ["pytest>=8.0"]
 
 [project.urls]
